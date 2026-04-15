@@ -109,6 +109,9 @@ td.diff-zero{color:var(--text-muted);font-family:var(--mono);font-size:12.5px;te
 .price-row .price-unit{font-size:11px;color:var(--text-muted);min-width:34px}
 .update-btn{background:var(--green);color:white;border:none;border-radius:6px;padding:9px 26px;font-family:'IBM Plex Sans',sans-serif;font-size:13.5px;font-weight:600;cursor:pointer;transition:background .15s;margin-top:18px}
 .update-btn:hover{background:var(--green-dark)}
+.refresh-sheet-btn{background:var(--card);color:var(--green-dark);border:1.5px solid var(--green-mid);border-radius:6px;padding:7px 16px;font-family:'IBM Plex Sans',sans-serif;font-size:13px;font-weight:500;cursor:pointer;transition:all .15s;white-space:nowrap;flex-shrink:0}
+.refresh-sheet-btn:hover{background:var(--green-light)}
+.refresh-sheet-btn:disabled{opacity:0.6;cursor:not-allowed}
 .update-msg{font-size:12px;color:var(--green);margin-top:8px;opacity:0;transition:opacity .3s}
 .update-msg.show{opacity:1}
 </style>
@@ -180,9 +183,15 @@ td.diff-zero{color:var(--text-muted);font-family:var(--mono);font-size:12.5px;te
 
 <div id="tab-precios" class="panel">
   <div class="section-label">Precios de referencia</div>
-  <p style="font-size:13px;color:var(--text-muted);margin-bottom:18px">Los precios se guardan automáticamente en el navegador.</p>
+  <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px">
+    <p style="font-size:13px;color:var(--text-muted);margin:0">Los precios se guardan automáticamente en el navegador. Podés editarlos manualmente o actualizarlos desde la planilla.</p>
+    <button class="refresh-sheet-btn" id="refreshSheetBtn" onclick="fetchSheetPrices()">
+      <span id="refreshIcon">↻</span> Actualizar desde planilla
+    </button>
+  </div>
+  <div id="sheetStatus" style="font-size:12px;margin-bottom:12px;min-height:18px"></div>
   <div class="prices-grid" id="priceGrid"></div>
-  <button class="update-btn" onclick="applyPrices()">Actualizar y recalcular</button>
+  <button class="update-btn" onclick="applyPrices()">Guardar cambios y recalcular</button>
   <div class="update-msg" id="updateMsg">✓ Precios actualizados y guardados.</div>
 </div>
 
@@ -234,8 +243,10 @@ const BASE_PRODUCTS = {
 };
 
 // ═══════════════════════════════════════════
-//  PRECIOS con localStorage
+//  PRECIOS con localStorage + Google Sheets
 // ═══════════════════════════════════════════
+const SHEET_CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRtQYVnzyCQu8HP6uO2RDxy4u5o359-NWqBRssLYL8uoaEMMty0ikmLfaEyW6uOziOSaCdgvhd3m5rp/pub?gid=0&single=true&output=csv';
+
 let prices = {};
 function loadPrices() {
   Object.entries(BASE_PRODUCTS).forEach(([k,v])=>prices[k]=v.price);
@@ -251,6 +262,129 @@ function savePrices() {
   try { localStorage.setItem('sos_fert_prices', JSON.stringify(prices)); } catch(e) {}
 }
 loadPrices();
+
+// Mapeo de nombres posibles en la planilla → nombre en BASE_PRODUCTS
+const SHEET_NAME_MAP = {
+  'map': 'MAP',
+  'spt': 'SPT',
+  'dap': 'DAP',
+  'sps': 'SPS',
+  'mezcla 740': 'Mezcla 740',
+  'nutrimax': 'Nutrimax',
+  'mezcla 636': 'Mezcla 636',
+  'microessentials sz': 'MicroEssentials SZ',
+  'macrozinc': 'MacroZinc',
+  'microessentials s9': 'MicroEssentials S9',
+  'azufertil': 'Azufertil',
+  'azufértil': 'Azufertil',
+  'urea': 'Urea',
+  'urea protegida': 'Urea Protegida',
+  'urea s': 'Urea S',
+  'solmix (80-20)': 'SolMix (80-20)',
+  'solmix 80-20': 'SolMix (80-20)',
+  'solmix': 'SolMix (80-20)',
+  'solmix zn': 'SolMix Zn',
+  'aplicación': 'Aplicación',
+  'aplicacion': 'Aplicación',
+};
+
+function parseCSV(text) {
+  // Elimina BOM si existe
+  text = text.replace(/^\uFEFF/, '');
+  const lines = text.trim().split(/\r?\n/);
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(',').map(h => h.trim().replace(/"/g,'').toLowerCase());
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i].split(',').map(c => c.trim().replace(/"/g,''));
+    const row = {};
+    headers.forEach((h, idx) => row[h] = cols[idx] || '');
+    rows.push(row);
+  }
+  return rows;
+}
+
+async function fetchSheetPrices() {
+  const btn = document.getElementById('refreshSheetBtn');
+  const statusEl = document.getElementById('sheetStatus');
+  const icon = document.getElementById('refreshIcon');
+  btn.disabled = true;
+  icon.style.display = 'inline-block';
+  icon.style.animation = 'spin 1s linear infinite';
+  statusEl.style.color = 'var(--text-muted)';
+  statusEl.textContent = 'Actualizando precios desde la planilla...';
+
+  // Agregar animación CSS si no existe
+  if (!document.getElementById('spinStyle')) {
+    const style = document.createElement('style');
+    style.id = 'spinStyle';
+    style.textContent = '@keyframes spin { from {transform:rotate(0deg)} to {transform:rotate(360deg)} }';
+    document.head.appendChild(style);
+  }
+
+  try {
+    const resp = await fetch(SHEET_CSV_URL, { cache: 'no-store' });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const text = await resp.text();
+    const rows = parseCSV(text);
+
+    // Detectar columnas: buscar columna de producto/nombre y precio
+    // La planilla puede tener: Producto, Precio, Proveedor (u otras)
+    // Ignoramos Proveedor completamente
+    if (rows.length === 0) throw new Error('La planilla está vacía');
+
+    const sampleRow = rows[0];
+    const keys = Object.keys(sampleRow);
+
+    // Buscar columna de nombre del producto
+    const nameCol = keys.find(k => ['producto','nombre','name','product'].includes(k.toLowerCase())) 
+      || keys.find(k => k.toLowerCase().includes('product') || k.toLowerCase().includes('nombre'))
+      || keys[0];
+
+    // Buscar columna de precio (excluir proveedor)
+    const priceCol = keys.find(k => ['precio','price','valor','value'].includes(k.toLowerCase()))
+      || keys.find(k => k.toLowerCase().includes('precio') || k.toLowerCase().includes('price'))
+      || keys.find(k => k !== nameCol && !k.toLowerCase().includes('proveedor') && !k.toLowerCase().includes('provider'));
+
+    if (!nameCol || !priceCol) throw new Error('No se encontraron columnas de producto y precio');
+
+    let updated = 0;
+    const notFound = [];
+
+    rows.forEach(row => {
+      const rawName = (row[nameCol] || '').trim();
+      if (!rawName) return;
+      const normalizedName = rawName.toLowerCase().replace(/\s+/g, ' ');
+      const prodKey = SHEET_NAME_MAP[normalizedName] || 
+        Object.keys(BASE_PRODUCTS).find(k => k.toLowerCase() === normalizedName);
+
+      const rawPrice = (row[priceCol] || '').replace(/[^0-9.,]/g, '').replace(',', '.');
+      const price = parseFloat(rawPrice);
+
+      if (prodKey && !isNaN(price) && price > 0) {
+        prices[prodKey] = price;
+        updated++;
+      } else if (rawName && !prodKey) {
+        notFound.push(rawName);
+      }
+    });
+
+    savePrices();
+    renderPriceGrid();
+    recalcAll();
+
+    statusEl.style.color = 'var(--green)';
+    statusEl.textContent = `✓ ${updated} precio${updated !== 1 ? 's' : ''} actualizado${updated !== 1 ? 's' : ''} desde la planilla. ${notFound.length > 0 ? `(${notFound.length} producto${notFound.length>1?'s':''} no reconocido${notFound.length>1?'s':''}: ${notFound.slice(0,3).join(', ')}${notFound.length>3?'...':''})` : ''}`;
+
+  } catch (err) {
+    statusEl.style.color = 'var(--red)';
+    statusEl.textContent = `✗ Error al actualizar: ${err.message}. Verificá que la planilla sea pública.`;
+    console.error('Sheet fetch error:', err);
+  } finally {
+    btn.disabled = false;
+    icon.style.animation = '';
+  }
+}
 
 // ═══════════════════════════════════════════
 //  ALTERNATIVAS FIJAS
@@ -677,7 +811,10 @@ function applyPrices() {
   savePrices();
   recalcAll();
   const msg = document.getElementById('updateMsg');
+  const statusEl = document.getElementById('sheetStatus');
   msg.classList.add('show');
+  statusEl.style.color = 'var(--green)';
+  statusEl.textContent = '✓ Precios editados guardados en el navegador.';
   setTimeout(()=>msg.classList.remove('show'), 2500);
 }
 
